@@ -9,10 +9,10 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from utils.datasets import letterbox
-from utils.general import non_max_suppression, make_divisible, scale_coords, xyxy2xywh
-from utils.plots import color_list, plot_one_box
-from utils.torch_utils import time_synchronized
+from yolov5.utils.datasets import letterbox
+from yolov5.utils.general import non_max_suppression, make_divisible, scale_coords, xyxy2xywh
+from yolov5.utils.plots import color_list, plot_one_box
+from yolov5.utils.torch_utils import time_synchronized
 
 
 def autopad(k, p=None):  # kernel, padding
@@ -278,7 +278,7 @@ class Detections:
     def print(self):
         self.display(pprint=True)  # print results
         print(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {tuple(self.s)}' %
-              tuple(self.t))                      
+              tuple(self.t))
 
     def show(self):
         self.display(show=True)  # show results
@@ -312,5 +312,6 @@ class Classify(nn.Module):
         self.flat = nn.Flatten()
 
     def forward(self, x):
+        print()
         z = torch.cat([self.aap(y) for y in (x if isinstance(x, list) else [x])], 1)  # cat if list
         return self.flat(self.conv(z))  # flatten to x(b,c2)

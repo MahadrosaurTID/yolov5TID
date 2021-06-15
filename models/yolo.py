@@ -6,11 +6,11 @@ from copy import deepcopy
 sys.path.append('./')  # to run '$ python *.py' files in subdirectories
 logger = logging.getLogger(__name__)
 
-from models.common import *
-from models.experimental import *
-from utils.autoanchor import check_anchor_order
-from utils.general import make_divisible, check_file, set_logging
-from utils.torch_utils import time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
+from yolov5.models.common import *
+from yolov5.models.experimental import *
+from yolov5.utils.autoanchor import check_anchor_order
+from yolov5.utils.general import make_divisible, check_file, set_logging, non_max_suppression, xyxy2xywh, xywh2xyxy
+from yolov5.utils.torch_utils import time_synchronized, fuse_conv_and_bn, model_info, scale_img, initialize_weights, \
     select_device, copy_attr
 
 try:
@@ -36,10 +36,12 @@ class Detect(nn.Module):
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
 
     def forward(self, x):
+        inp = []
         # x = x.copy()  # for profiling
         z = []  # inference output
         self.training |= self.export
         for i in range(self.nl):
+            inp.append(x[i])
             x[i] = self.m[i](x[i])  # conv
             bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
             x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
@@ -53,7 +55,27 @@ class Detect(nn.Module):
                 y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
                 z.append(y.view(bs, -1, self.no))
 
-        return x if self.training else (torch.cat(z, 1), x)
+        # MAHAD
+        # pred = non_max_suppression(torch.cat(z, 1), conf_thres=0.85)
+        i = 2  # first layer with 128 depth
+        out = z[i]
+        fvect = None
+
+        pred, idx = non_max_suppression(out, conf_thres=0.85)
+        if pred is None:
+            return None, None
+        pred_ = out[0, idx, :]
+        out_reshp = out.clone().view(1, 3, x[i].shape[2], x[i].shape[3], 6)
+        out_np = out_reshp.squeeze().numpy()
+        ind = np.array((np.where(out_np == pred_.squeeze().numpy())))[1:-1, 0]
+        iy, ix = ind[0], ind[1]
+        fvect = inp[i][:, :, iy, ix]
+        # else:
+        #     print("SOMETHING WRONG IN DETECT")
+        #
+
+        # return x if self.training else (torch.cat(z, 1), x)
+        return x if self.training else (pred, fvect)
 
     @staticmethod
     def _make_grid(nx=20, ny=20):
@@ -122,7 +144,10 @@ class Model(nn.Module):
 
     def forward_once(self, x, profile=False):
         y, dt = [], []  # outputs
-        for m in self.model:
+        n_layers = len(self.model)
+        fvect = None
+        for curr_layer, m in enumerate(self.model):
+
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
 
@@ -135,11 +160,13 @@ class Model(nn.Module):
                 print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
 
             x = m(x)  # run
+            if curr_layer == n_layers - 1:
+                x, fvect = x
             y.append(x if m.i in self.save else None)  # save output
 
         if profile:
             print('%.1fms total' % sum(dt))
-        return x
+        return x, fvect
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3
