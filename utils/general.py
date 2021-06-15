@@ -1,1055 +1,582 @@
-# Dataset utils and dataloaders
+# General utils
 
 import glob
 import logging
 import math
 import os
+import platform
 import random
-import shutil
+import re
+import subprocess
 import time
-from itertools import repeat
-from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from threading import Thread
 
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
-from PIL import Image, ExifTags
-from torch.utils.data import Dataset
-from tqdm import tqdm
+import torchvision
+import yaml
 
-from yolov5.utils.general import xyxy2xywh, xywh2xyxy, xywhn2xyxy, xyn2xy, segment2box, segments2boxes, resample_segments, \
-    clean_str
-from yolov5.utils.torch_utils import torch_distributed_zero_first
+from yolov5.utils.google_utils import gsutil_getsize
+from yolov5.utils.metrics import fitness
+from yolov5.utils.torch_utils import init_torch_seeds
 
-# Parameters
-help_url = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
-img_formats = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp']  # acceptable image suffixes
-vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
-logger = logging.getLogger(__name__)
-
-# Get orientation exif tag
-for orientation in ExifTags.TAGS.keys():
-    if ExifTags.TAGS[orientation] == 'Orientation':
-        break
+# Settings
+torch.set_printoptions(linewidth=320, precision=5, profile='long')
+np.set_printoptions(linewidth=320, formatter={'float_kind': '{:11.5g}'.format})  # format short g, %precision=5
+cv2.setNumThreads(0)  # prevent OpenCV from multithreading (incompatible with PyTorch DataLoader)
+os.environ['NUMEXPR_MAX_THREADS'] = str(min(os.cpu_count(), 8))  # NumExpr max threads
 
 
-def get_hash(files):
-    # Returns a single hash value of a list of files
-    return sum(os.path.getsize(f) for f in files if os.path.isfile(f))
+def set_logging(rank=-1):
+    logging.basicConfig(
+        format="%(message)s",
+        level=logging.INFO if rank in [-1, 0] else logging.WARN)
 
 
-def exif_size(img):
-    # Returns exif-corrected PIL size
-    s = img.size  # (width, height)
+def init_seeds(seed=0):
+    # Initialize random number generator (RNG) seeds
+    random.seed(seed)
+    np.random.seed(seed)
+    init_torch_seeds(seed)
+
+
+def get_latest_run(search_dir='.'):
+    # Return path to most recent 'last.pt' in /runs (i.e. to --resume from)
+    last_list = glob.glob(f'{search_dir}/**/last*.pt', recursive=True)
+    return max(last_list, key=os.path.getctime) if last_list else ''
+
+
+def isdocker():
+    # Is environment a Docker container
+    return Path('/workspace').exists()  # or Path('/.dockerenv').exists()
+
+
+def check_online():
+    # Check internet connectivity
+    import socket
     try:
-        rotation = dict(img._getexif().items())[orientation]
-        if rotation == 6:  # rotation 270
-            s = (s[1], s[0])
-        elif rotation == 8:  # rotation 90
-            s = (s[1], s[0])
-    except:
-        pass
-
-    return s
+        socket.create_connection(("1.1.1.1", 443), 5)  # check host accesability
+        return True
+    except OSError:
+        return False
 
 
-def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
-    # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
-    with torch_distributed_zero_first(rank):
-        dataset = LoadImagesAndLabels(path, imgsz, batch_size,
-                                      augment=augment,  # augment images
-                                      hyp=hyp,  # augmentation hyperparameters
-                                      rect=rect,  # rectangular training
-                                      cache_images=cache,
-                                      single_cls=opt.single_cls,
-                                      stride=int(stride),
-                                      pad=pad,
-                                      image_weights=image_weights,
-                                      prefix=prefix)
+def check_git_status():
+    # Recommend 'git pull' if code is out of date
+    print(colorstr('github: '), end='')
+    try:
+        assert Path('.git').exists(), 'skipping check (not a git repository)'
+        assert not isdocker(), 'skipping check (Docker image)'
+        assert check_online(), 'skipping check (offline)'
 
-    batch_size = min(batch_size, len(dataset))
-    nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
-    loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
-    # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
-    dataloader = loader(dataset,
-                        batch_size=batch_size,
-                        num_workers=nw,
-                        sampler=sampler,
-                        pin_memory=True,
-                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
-    return dataloader, dataset
-
-
-class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
-    """ Dataloader that reuses workers
-
-    Uses same syntax as vanilla DataLoader
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        object.__setattr__(self, 'batch_sampler', _RepeatSampler(self.batch_sampler))
-        self.iterator = super().__iter__()
-
-    def __len__(self):
-        return len(self.batch_sampler.sampler)
-
-    def __iter__(self):
-        for i in range(len(self)):
-            yield next(self.iterator)
-
-
-class _RepeatSampler(object):
-    """ Sampler that repeats forever
-
-    Args:
-        sampler (Sampler)
-    """
-
-    def __init__(self, sampler):
-        self.sampler = sampler
-
-    def __iter__(self):
-        while True:
-            yield from iter(self.sampler)
-
-
-class LoadImages:  # for inference
-    def __init__(self, path, img_size=640, stride=32):
-        p = str(Path(path).absolute())  # os-agnostic absolute path
-        if '*' in p:
-            files = sorted(glob.glob(p, recursive=True))  # glob
-        elif os.path.isdir(p):
-            files = sorted(glob.glob(os.path.join(p, '*.*')))  # dir
-        elif os.path.isfile(p):
-            files = [p]  # files
+        cmd = 'git fetch && git config --get remote.origin.url'
+        url = subprocess.check_output(cmd, shell=True).decode().strip().rstrip('.git')  # github repo url
+        branch = subprocess.check_output('git rev-parse --abbrev-ref HEAD', shell=True).decode().strip()  # checked out
+        n = int(subprocess.check_output(f'git rev-list {branch}..origin/master --count', shell=True))  # commits behind
+        if n > 0:
+            s = f"⚠️ WARNING: code is out of date by {n} commit{'s' * (n > 1)}. " \
+                f"Use 'git pull' to update or 'git clone {url}' to download latest."
         else:
-            raise Exception(f'ERROR: {p} does not exist')
-
-        images = [x for x in files if x.split('.')[-1].lower() in img_formats]
-        videos = [x for x in files if x.split('.')[-1].lower() in vid_formats]
-        ni, nv = len(images), len(videos)
-
-        self.img_size = img_size
-        self.stride = stride
-        self.files = images + videos
-        self.nf = ni + nv  # number of files
-        self.video_flag = [False] * ni + [True] * nv
-        self.mode = 'image'
-        if any(videos):
-            self.new_video(videos[0])  # new video
-        else:
-            self.cap = None
-        assert self.nf > 0, f'No images or videos found in {p}. ' \
-                            f'Supported formats are:\nimages: {img_formats}\nvideos: {vid_formats}'
-
-    def __iter__(self):
-        self.count = 0
-        return self
-
-    def __next__(self):
-        if self.count == self.nf:
-            raise StopIteration
-        path = self.files[self.count]
-
-        if self.video_flag[self.count]:
-            # Read video
-            self.mode = 'video'
-            ret_val, img0 = self.cap.read()
-            if not ret_val:
-                self.count += 1
-                self.cap.release()
-                if self.count == self.nf:  # last video
-                    raise StopIteration
-                else:
-                    path = self.files[self.count]
-                    self.new_video(path)
-                    ret_val, img0 = self.cap.read()
-
-            self.frame += 1
-            print(f'video {self.count + 1}/{self.nf} ({self.frame}/{self.nframes}) {path}: ', end='')
-
-        else:
-            # Read image
-            self.count += 1
-            img0 = cv2.imread(path)  # BGR
-            assert img0 is not None, 'Image Not Found ' + path
-            print(f'image {self.count}/{self.nf} {path}: ', end='')
-
-        # Padded resize
-        img = letterbox(img0, self.img_size, stride=self.stride)[0]
-
-        # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
-        img = np.ascontiguousarray(img)
-
-        return path, img, img0, self.cap
-
-    def new_video(self, path):
-        self.frame = 0
-        self.cap = cv2.VideoCapture(path)
-        self.nframes = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    def __len__(self):
-        return self.nf  # number of files
-
-
-class LoadWebcam:  # for inference
-    def __init__(self, pipe='0', img_size=640, stride=32):
-        self.img_size = img_size
-        self.stride = stride
-
-        if pipe.isnumeric():
-            pipe = eval(pipe)  # local camera
-        # pipe = 'rtsp://192.168.1.64/1'  # IP camera
-        # pipe = 'rtsp://username:password@192.168.1.64/1'  # IP camera with login
-        # pipe = 'http://wmccpinetop.axiscam.net/mjpg/video.mjpg'  # IP golf camera
-
-        self.pipe = pipe
-        self.cap = cv2.VideoCapture(pipe)  # video capture object
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)  # set buffer size
-
-    def __iter__(self):
-        self.count = -1
-        return self
-
-    def __next__(self):
-        self.count += 1
-        if cv2.waitKey(1) == ord('q'):  # q to quit
-            self.cap.release()
-            cv2.destroyAllWindows()
-            raise StopIteration
-
-        # Read frame
-        if self.pipe == 0:  # local camera
-            ret_val, img0 = self.cap.read()
-            img0 = cv2.flip(img0, 1)  # flip left-right
-        else:  # IP camera
-            n = 0
-            while True:
-                n += 1
-                self.cap.grab()
-                if n % 30 == 0:  # skip frames
-                    ret_val, img0 = self.cap.retrieve()
-                    if ret_val:
-                        break
-
-        # Print
-        assert ret_val, f'Camera Error {self.pipe}'
-        img_path = 'webcam.jpg'
-        print(f'webcam {self.count}: ', end='')
-
-        # Padded resize
-        img = letterbox(img0, self.img_size, stride=self.stride)[0]
-
-        # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
-        img = np.ascontiguousarray(img)
-
-        return img_path, img, img0, None
-
-    def __len__(self):
-        return 0
-
-
-class LoadStreams:  # multiple IP or RTSP cameras
-    def __init__(self, sources='streams.txt', img_size=640, stride=32):
-        self.mode = 'stream'
-        self.img_size = img_size
-        self.stride = stride
-
-        if os.path.isfile(sources):
-            with open(sources, 'r') as f:
-                sources = [x.strip() for x in f.read().strip().splitlines() if len(x.strip())]
-        else:
-            sources = [sources]
-
-        n = len(sources)
-        self.imgs = [None] * n
-        self.sources = [clean_str(x) for x in sources]  # clean source names for later
-        for i, s in enumerate(sources):
-            # Start the thread to read frames from the video stream
-            print(f'{i + 1}/{n}: {s}... ', end='')
-            cap = cv2.VideoCapture(eval(s) if s.isnumeric() else s)
-            assert cap.isOpened(), f'Failed to open {s}'
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS) % 100
-            _, self.imgs[i] = cap.read()  # guarantee first frame
-            thread = Thread(target=self.update, args=([i, cap]), daemon=True)
-            print(f' success ({w}x{h} at {fps:.2f} FPS).')
-            thread.start()
-        print('')  # newline
-
-        # check for common shapes
-        s = np.stack([letterbox(x, self.img_size, stride=self.stride)[0].shape for x in self.imgs], 0)  # shapes
-        self.rect = np.unique(s, axis=0).shape[0] == 1  # rect inference if all shapes equal
-        if not self.rect:
-            print('WARNING: Different stream shapes detected. For optimal performance supply similarly-shaped streams.')
-
-    def update(self, index, cap):
-        # Read next stream frame in a daemon thread
-        n = 0
-        while cap.isOpened():
-            n += 1
-            # _, self.imgs[index] = cap.read()
-            cap.grab()
-            if n == 4:  # read every 4th frame
-                success, im = cap.retrieve()
-                self.imgs[index] = im if success else self.imgs[index] * 0
-                n = 0
-            time.sleep(0.01)  # wait time
-
-    def __iter__(self):
-        self.count = -1
-        return self
-
-    def __next__(self):
-        self.count += 1
-        img0 = self.imgs.copy()
-        if cv2.waitKey(1) == ord('q'):  # q to quit
-            cv2.destroyAllWindows()
-            raise StopIteration
-
-        # Letterbox
-        img = [letterbox(x, self.img_size, auto=self.rect, stride=self.stride)[0] for x in img0]
-
-        # Stack
-        img = np.stack(img, 0)
-
-        # Convert
-        img = img[:, :, :, ::-1].transpose(0, 3, 1, 2)  # BGR to RGB, to bsx3x416x416
-        img = np.ascontiguousarray(img)
-
-        return self.sources, img, img0, None
-
-    def __len__(self):
-        return 0  # 1E12 frames = 32 streams at 30 FPS for 30 years
-
-
-def img2label_paths(img_paths):
-    # Define label paths as a function of image paths
-    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
-    return ['txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
-
-
-class LoadImagesAndLabels(Dataset):  # for training/testing
-    def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
-        self.img_size = img_size
-        self.augment = augment
-        self.hyp = hyp
-        self.image_weights = image_weights
-        self.rect = False if image_weights else rect
-        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
-        self.mosaic_border = [-img_size // 2, -img_size // 2]
-        self.stride = stride
-        self.path = path
-
-        try:
-            f = []  # image files
-            for p in path if isinstance(path, list) else [path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(p / '**' / '*.*'), recursive=True)
-                    # f = list(p.rglob('**/*.*'))  # pathlib
-                elif p.is_file():  # file
-                    with open(p, 'r') as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
-                        # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
-                else:
-                    raise Exception(f'{prefix}{p} does not exist')
-            self.img_files = sorted([x.replace('/', os.sep) for x in f if x.split('.')[-1].lower() in img_formats])
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in img_formats])  # pathlib
-            assert self.img_files, f'{prefix}No images found'
-        except Exception as e:
-            raise Exception(f'{prefix}Error loading data from {path}: {e}\nSee {help_url}')
-
-        # Check cache
-        self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
-        if cache_path.is_file():
-            cache, exists = torch.load(cache_path), True  # load
-            if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
-                cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
-        else:
-            cache, exists = self.cache_labels(cache_path, prefix), False  # cache
-
-        # Display cache
-        nf, nm, ne, nc, n = cache.pop('results')  # found, missing, empty, corrupted, total
-        if exists:
-            d = f"Scanning '{cache_path}' images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupted"
-            tqdm(None, desc=prefix + d, total=n, initial=n)  # display cache results
-        assert nf > 0 or not augment, f'{prefix}No labels in {cache_path}. Can not train without labels. See {help_url}'
-
-        # Read cache
-        cache.pop('hash')  # remove hash
-        cache.pop('version')  # remove version
-        labels, shapes, self.segments = zip(*cache.values())
-        self.labels = list(labels)
-        self.shapes = np.array(shapes, dtype=np.float64)
-        self.img_files = list(cache.keys())  # update
-        self.label_files = img2label_paths(cache.keys())  # update
-        if single_cls:
-            for x in self.labels:
-                x[:, 0] = 0
-
-        n = len(shapes)  # number of images
-        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
-        nb = bi[-1] + 1  # number of batches
-        self.batch = bi  # batch index of image
-        self.n = n
-        self.indices = range(n)
-
-        # Rectangular Training
-        if self.rect:
-            # Sort by aspect ratio
-            s = self.shapes  # wh
-            ar = s[:, 1] / s[:, 0]  # aspect ratio
-            irect = ar.argsort()
-            self.img_files = [self.img_files[i] for i in irect]
-            self.label_files = [self.label_files[i] for i in irect]
-            self.labels = [self.labels[i] for i in irect]
-            self.shapes = s[irect]  # wh
-            ar = ar[irect]
-
-            # Set training image shapes
-            shapes = [[1, 1]] * nb
-            for i in range(nb):
-                ari = ar[bi == i]
-                mini, maxi = ari.min(), ari.max()
-                if maxi < 1:
-                    shapes[i] = [maxi, 1]
-                elif mini > 1:
-                    shapes[i] = [1, 1 / mini]
-
-            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
-
-        # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
-        self.imgs = [None] * n
-        if cache_images:
-            gb = 0  # Gigabytes of cached images
-            self.img_hw0, self.img_hw = [None] * n, [None] * n
-            results = ThreadPool(8).imap(lambda x: load_image(*x), zip(repeat(self), range(n)))  # 8 threads
-            pbar = tqdm(enumerate(results), total=n)
-            for i, x in pbar:
-                self.imgs[i], self.img_hw0[i], self.img_hw[i] = x  # img, hw_original, hw_resized = load_image(self, i)
-                gb += self.imgs[i].nbytes
-                pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB)'
-
-    def cache_labels(self, path=Path('./labels.cache'), prefix=''):
-        # Cache dataset labels, check images and read shapes
-        x = {}  # dict
-        nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, duplicate
-        pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
-        for i, (im_file, lb_file) in enumerate(pbar):
-            try:
-                # verify images
-                im = Image.open(im_file)
-                im.verify()  # PIL verify
-                shape = exif_size(im)  # image size
-                segments = []  # instance segments
-                assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
-                assert im.format.lower() in img_formats, f'invalid image format {im.format}'
-
-                # verify labels
-                if os.path.isfile(lb_file):
-                    nf += 1  # label found
-                    with open(lb_file, 'r') as f:
-                        l = [x.split() for x in f.read().strip().splitlines()]
-                        if any([len(x) > 8 for x in l]):  # is segment
-                            classes = np.array([x[0] for x in l], dtype=np.float32)
-                            segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
-                            l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
-                        l = np.array(l, dtype=np.float32)
-                    if len(l):
-                        assert l.shape[1] == 5, 'labels require 5 columns each'
-                        assert (l >= 0).all(), 'negative labels'
-                        assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
-                        assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
-                    else:
-                        ne += 1  # label empty
-                        l = np.zeros((0, 5), dtype=np.float32)
-                else:
-                    nm += 1  # label missing
-                    l = np.zeros((0, 5), dtype=np.float32)
-                x[im_file] = [l, shape, segments]
-            except Exception as e:
-                nc += 1
-                print(f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}')
-
-            pbar.desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels... " \
-                        f"{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
-
-        if nf == 0:
-            print(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
-
-        x['hash'] = get_hash(self.label_files + self.img_files)
-        x['results'] = nf, nm, ne, nc, i + 1
-        x['version'] = 0.1  # cache version
-        torch.save(x, path)  # save for next time
-        logging.info(f'{prefix}New cache created: {path}')
-        return x
-
-    def __len__(self):
-        return len(self.img_files)
-
-    # def __iter__(self):
-    #     self.count = -1
-    #     print('ran dataset iter')
-    #     #self.shuffled_vector = np.random.permutation(self.nF) if self.augment else np.arange(self.nF)
-    #     return self
-
-    def __getitem__(self, index):
-        index = self.indices[index]  # linear, shuffled, or image_weights
-
-        hyp = self.hyp
-        mosaic = self.mosaic and random.random() < hyp['mosaic']
-        if mosaic:
-            # Load mosaic
-            img, labels = load_mosaic(self, index)
-            shapes = None
-
-            # MixUp https://arxiv.org/pdf/1710.09412.pdf
-            if random.random() < hyp['mixup']:
-                img2, labels2 = load_mosaic(self, random.randint(0, self.n - 1))
-                r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
-                img = (img * r + img2 * (1 - r)).astype(np.uint8)
-                labels = np.concatenate((labels, labels2), 0)
-
-        else:
-            # Load image
-            img, (h0, w0), (h, w) = load_image(self, index)
-
-            # Letterbox
-            shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
-            img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
-            shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
-
-            labels = self.labels[index].copy()
-            if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
-
-        if self.augment:
-            # Augment imagespace
-            if not mosaic:
-                img, labels = random_perspective(img, labels,
-                                                 degrees=hyp['degrees'],
-                                                 translate=hyp['translate'],
-                                                 scale=hyp['scale'],
-                                                 shear=hyp['shear'],
-                                                 perspective=hyp['perspective'])
-
-            # Augment colorspace
-            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
-
-            # Apply cutouts
-            # if random.random() < 0.9:
-            #     labels = cutout(img, labels)
-
-        nL = len(labels)  # number of labels
-        if nL:
-            labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
-            labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
-            labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
-
-        if self.augment:
-            # flip up-down
-            if random.random() < hyp['flipud']:
-                img = np.flipud(img)
-                if nL:
-                    labels[:, 2] = 1 - labels[:, 2]
-
-            # flip left-right
-            if random.random() < hyp['fliplr']:
-                img = np.fliplr(img)
-                if nL:
-                    labels[:, 1] = 1 - labels[:, 1]
-
-        labels_out = torch.zeros((nL, 6))
-        if nL:
-            labels_out[:, 1:] = torch.from_numpy(labels)
-
-        # Convert
-        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
-        img = np.ascontiguousarray(img)
-
-        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
-
-    @staticmethod
-    def collate_fn(batch):
-        img, label, path, shapes = zip(*batch)  # transposed
-        for i, l in enumerate(label):
-            l[:, 0] = i  # add target image index for build_targets()
-        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
-
-    @staticmethod
-    def collate_fn4(batch):
-        img, label, path, shapes = zip(*batch)  # transposed
-        n = len(shapes) // 4
-        img4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
-
-        ho = torch.tensor([[0., 0, 0, 1, 0, 0]])
-        wo = torch.tensor([[0., 0, 1, 0, 0, 0]])
-        s = torch.tensor([[1, 1, .5, .5, .5, .5]])  # scale
-        for i in range(n):  # zidane torch.zeros(16,3,720,1280)  # BCHW
-            i *= 4
-            if random.random() < 0.5:
-                im = F.interpolate(img[i].unsqueeze(0).float(), scale_factor=2., mode='bilinear', align_corners=False)[
-                    0].type(img[i].type())
-                l = label[i]
+            s = f'up to date with {url} ✅'
+        print(s.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else s)  # emoji-safe
+    except Exception as e:
+        print(e)
+
+
+def check_requirements(file='requirements.txt', exclude=()):
+    # Check installed dependencies meet requirements
+    import pkg_resources
+    requirements = [f'{x.name}{x.specifier}' for x in pkg_resources.parse_requirements(Path(file).open())
+                    if x.name not in exclude]
+    pkg_resources.require(requirements)  # DistributionNotFound or VersionConflict exception if requirements not met
+
+
+def check_img_size(img_size, s=32):
+    # Verify img_size is a multiple of stride s
+    new_size = make_divisible(img_size, int(s))  # ceil gs-multiple
+    if new_size != img_size:
+        print('WARNING: --img-size %g must be multiple of max stride %g, updating to %g' % (img_size, s, new_size))
+    return new_size
+
+
+def check_imshow():
+    # Check if environment supports image displays
+    try:
+        assert not isdocker(), 'cv2.imshow() is disabled in Docker environments'
+        cv2.imshow('test', np.zeros((1, 1, 3)))
+        cv2.waitKey(1)
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+        return True
+    except Exception as e:
+        print(f'WARNING: Environment does not support cv2.imshow() or PIL Image.show() image displays\n{e}')
+        return False
+
+
+def check_file(file):
+    # Search for file if not found
+    if os.path.isfile(file) or file == '':
+        return file
+    else:
+        files = glob.glob('./**/' + file, recursive=True)  # find file
+        assert len(files), 'File Not Found: %s' % file  # assert file was found
+        assert len(files) == 1, "Multiple files match '%s', specify exact path: %s" % (file, files)  # assert unique
+        return files[0]  # return file
+
+
+def check_dataset(dict):
+    # Download dataset if not found locally
+    val, s = dict.get('val'), dict.get('download')
+    if val and len(val):
+        val = [Path(x).resolve() for x in (val if isinstance(val, list) else [val])]  # val path
+        if not all(x.exists() for x in val):
+            print('\nWARNING: Dataset not found, nonexistent paths: %s' % [str(x) for x in val if not x.exists()])
+            if s and len(s):  # download script
+                print('Downloading %s ...' % s)
+                if s.startswith('http') and s.endswith('.zip'):  # URL
+                    f = Path(s).name  # filename
+                    torch.hub.download_url_to_file(s, f)
+                    r = os.system('unzip -q %s -d ../ && rm %s' % (f, f))  # unzip
+                else:  # bash script
+                    r = os.system(s)
+                print('Dataset autodownload %s\n' % ('success' if r == 0 else 'failure'))  # analyze return value
             else:
-                im = torch.cat((torch.cat((img[i], img[i + 1]), 1), torch.cat((img[i + 2], img[i + 3]), 1)), 2)
-                l = torch.cat((label[i], label[i + 1] + ho, label[i + 2] + wo, label[i + 3] + ho + wo), 0) * s
-            img4.append(im)
-            label4.append(l)
-
-        for i, l in enumerate(label4):
-            l[:, 0] = i  # add target image index for build_targets()
-
-        return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
+                raise Exception('Dataset not found.')
 
 
-# Ancillary functions --------------------------------------------------------------------------------------------------
-def load_image(self, index):
-    # loads 1 image from dataset, returns img, original hw, resized hw
-    img = self.imgs[index]
-    if img is None:  # not cached
-        path = self.img_files[index]
-        img = cv2.imread(path)  # BGR
-        assert img is not None, 'Image Not Found ' + path
-        h0, w0 = img.shape[:2]  # orig hw
-        r = self.img_size / max(h0, w0)  # resize image to img_size
-        if r != 1:  # always resize down, only resize up if training with augmentation
-            interp = cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR
-            img = cv2.resize(img, (int(w0 * r), int(h0 * r)), interpolation=interp)
-        return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
+def make_divisible(x, divisor):
+    # Returns x evenly divisible by divisor
+    return math.ceil(x / divisor) * divisor
+
+
+def clean_str(s):
+    # Cleans a string by replacing special characters with underscore _
+    return re.sub(pattern="[|@#!¡·$€%&()=?¿^*;:,¨´><+]", repl="_", string=s)
+
+
+def one_cycle(y1=0.0, y2=1.0, steps=100):
+    # lambda function for sinusoidal ramp from y1 to y2
+    return lambda x: ((1 - math.cos(x * math.pi / steps)) / 2) * (y2 - y1) + y1
+
+
+def colorstr(*input):
+    # Colors a string https://en.wikipedia.org/wiki/ANSI_escape_code, i.e.  colorstr('blue', 'hello world')
+    *args, string = input if len(input) > 1 else ('blue', 'bold', input[0])  # color arguments, string
+    colors = {'black': '\033[30m',  # basic colors
+              'red': '\033[31m',
+              'green': '\033[32m',
+              'yellow': '\033[33m',
+              'blue': '\033[34m',
+              'magenta': '\033[35m',
+              'cyan': '\033[36m',
+              'white': '\033[37m',
+              'bright_black': '\033[90m',  # bright colors
+              'bright_red': '\033[91m',
+              'bright_green': '\033[92m',
+              'bright_yellow': '\033[93m',
+              'bright_blue': '\033[94m',
+              'bright_magenta': '\033[95m',
+              'bright_cyan': '\033[96m',
+              'bright_white': '\033[97m',
+              'end': '\033[0m',  # misc
+              'bold': '\033[1m',
+              'underline': '\033[4m'}
+    return ''.join(colors[x] for x in args) + f'{string}' + colors['end']
+
+
+def labels_to_class_weights(labels, nc=80):
+    # Get class weights (inverse frequency) from training labels
+    if labels[0] is None:  # no labels loaded
+        return torch.Tensor()
+
+    labels = np.concatenate(labels, 0)  # labels.shape = (866643, 5) for COCO
+    classes = labels[:, 0].astype(np.int)  # labels = [class xywh]
+    weights = np.bincount(classes, minlength=nc)  # occurrences per class
+
+    # Prepend gridpoint count (for uCE training)
+    # gpi = ((320 / 32 * np.array([1, 2, 4])) ** 2 * 3).sum()  # gridpoints per image
+    # weights = np.hstack([gpi * len(labels)  - weights.sum() * 9, weights * 9]) ** 0.5  # prepend gridpoints to start
+
+    weights[weights == 0] = 1  # replace empty bins with 1
+    weights = 1 / weights  # number of targets per class
+    weights /= weights.sum()  # normalize
+    return torch.from_numpy(weights)
+
+
+def labels_to_image_weights(labels, nc=80, class_weights=np.ones(80)):
+    # Produces image weights based on class_weights and image contents
+    class_counts = np.array([np.bincount(x[:, 0].astype(np.int), minlength=nc) for x in labels])
+    image_weights = (class_weights.reshape(1, nc) * class_counts).sum(1)
+    # index = random.choices(range(n), weights=image_weights, k=1)  # weight image sample
+    return image_weights
+
+
+def coco80_to_coco91_class():  # converts 80-index (val2014) to 91-index (paper)
+    # https://tech.amikelive.com/node-718/what-object-categories-labels-are-in-coco-dataset/
+    # a = np.loadtxt('data/coco.names', dtype='str', delimiter='\n')
+    # b = np.loadtxt('data/coco_paper.names', dtype='str', delimiter='\n')
+    # x1 = [list(a[i] == b).index(True) + 1 for i in range(80)]  # darknet to coco
+    # x2 = [list(b[i] == a).index(True) if any(b[i] == a) else None for i in range(91)]  # coco to darknet
+    x = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 27, 28, 31, 32, 33, 34,
+         35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63,
+         64, 65, 67, 70, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 84, 85, 86, 87, 88, 89, 90]
+    return x
+
+
+def xyxy2xywh(x):
+    # Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] where xy1=top-left, xy2=bottom-right
+    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y[:, 0] = (x[:, 0] + x[:, 2]) / 2  # x center
+    y[:, 1] = (x[:, 1] + x[:, 3]) / 2  # y center
+    y[:, 2] = x[:, 2] - x[:, 0]  # width
+    y[:, 3] = x[:, 3] - x[:, 1]  # height
+    return y
+
+
+def xywh2xyxy(x):
+    # Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
+    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y[:, 0] = x[:, 0] - x[:, 2] / 2  # top left x
+    y[:, 1] = x[:, 1] - x[:, 3] / 2  # top left y
+    y[:, 2] = x[:, 0] + x[:, 2] / 2  # bottom right x
+    y[:, 3] = x[:, 1] + x[:, 3] / 2  # bottom right y
+    return y
+
+
+def xywhn2xyxy(x, w=640, h=640, padw=0, padh=0):
+    # Convert nx4 boxes from [x, y, w, h] normalized to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
+    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y[:, 0] = w * (x[:, 0] - x[:, 2] / 2) + padw  # top left x
+    y[:, 1] = h * (x[:, 1] - x[:, 3] / 2) + padh  # top left y
+    y[:, 2] = w * (x[:, 0] + x[:, 2] / 2) + padw  # bottom right x
+    y[:, 3] = h * (x[:, 1] + x[:, 3] / 2) + padh  # bottom right y
+    return y
+
+
+def xyn2xy(x, w=640, h=640, padw=0, padh=0):
+    # Convert normalized segments into pixel segments, shape (n,2)
+    y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+    y[:, 0] = w * x[:, 0] + padw  # top left x
+    y[:, 1] = h * x[:, 1] + padh  # top left y
+    return y
+
+
+def segment2box(segment, width=640, height=640):
+    # Convert 1 segment label to 1 box label, applying inside-image constraint, i.e. (xy1, xy2, ...) to (xyxy)
+    x, y = segment.T  # segment xy
+    inside = (x >= 0) & (y >= 0) & (x <= width) & (y <= height)
+    x, y, = x[inside], y[inside]
+    return np.array([x.min(), y.min(), x.max(), y.max()]) if any(x) else np.zeros((1, 4))  # cls, xyxy
+
+
+def segments2boxes(segments):
+    # Convert segment labels to box labels, i.e. (cls, xy1, xy2, ...) to (cls, xywh)
+    boxes = []
+    for s in segments:
+        x, y = s.T  # segment xy
+        boxes.append([x.min(), y.min(), x.max(), y.max()])  # cls, xyxy
+    return xyxy2xywh(np.array(boxes))  # cls, xywh
+
+
+def resample_segments(segments, n=1000):
+    # Up-sample an (n,2) segment
+    for i, s in enumerate(segments):
+        x = np.linspace(0, len(s) - 1, n)
+        xp = np.arange(len(s))
+        segments[i] = np.concatenate([np.interp(x, xp, s[:, i]) for i in range(2)]).reshape(2, -1).T  # segment xy
+    return segments
+
+
+def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
+    # Rescale coords (xyxy) from img1_shape to img0_shape
+    if ratio_pad is None:  # calculate from img0_shape
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
+        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
     else:
-        return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
+        gain = ratio_pad[0][0]
+        pad = ratio_pad[1]
+
+    coords[:, [0, 2]] -= pad[0]  # x padding
+    coords[:, [1, 3]] -= pad[1]  # y padding
+    coords[:, :4] /= gain
+    clip_coords(coords, img0_shape)
+    return coords
 
 
-def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
-    r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1  # random gains
-    hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_BGR2HSV))
-    dtype = img.dtype  # uint8
-
-    x = np.arange(0, 256, dtype=np.int16)
-    lut_hue = ((x * r[0]) % 180).astype(dtype)
-    lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
-    lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
-
-    img_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val))).astype(dtype)
-    cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)  # no return needed
+def clip_coords(boxes, img_shape):
+    # Clip bounding xyxy bounding boxes to image shape (height, width)
+    boxes[:, 0].clamp_(0, img_shape[1])  # x1
+    boxes[:, 1].clamp_(0, img_shape[0])  # y1
+    boxes[:, 2].clamp_(0, img_shape[1])  # x2
+    boxes[:, 3].clamp_(0, img_shape[0])  # y2
 
 
-def hist_equalize(img, clahe=True, bgr=False):
-    # Equalize histogram on BGR image 'img' with img.shape(n,m,3) and range 0-255
-    yuv = cv2.cvtColor(img, cv2.COLOR_BGR2YUV if bgr else cv2.COLOR_RGB2YUV)
-    if clahe:
-        c = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        yuv[:, :, 0] = c.apply(yuv[:, :, 0])
-    else:
-        yuv[:, :, 0] = cv2.equalizeHist(yuv[:, :, 0])  # equalize Y channel histogram
-    return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR if bgr else cv2.COLOR_YUV2RGB)  # convert YUV image to RGB
+def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
+    # Returns the IoU of box1 to box2. box1 is 4, box2 is nx4
+    box2 = box2.T
 
-
-def load_mosaic(self, index):
-    # loads images in a 4-mosaic
-
-    labels4, segments4 = [], []
-    s = self.img_size
-    yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
-    indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
-    for i, index in enumerate(indices):
-        # Load image
-        img, _, (h, w) = load_image(self, index)
-
-        # place img in img4
-        if i == 0:  # top left
-            img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
-            x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
-            x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
-        elif i == 1:  # top right
-            x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
-            x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
-        elif i == 2:  # bottom left
-            x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
-            x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
-        elif i == 3:  # bottom right
-            x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
-            x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
-
-        img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
-        padw = x1a - x1b
-        padh = y1a - y1b
-
-        # Labels
-        labels, segments = self.labels[index].copy(), self.segments[index].copy()
-        if labels.size:
-            labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
-            segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
-        labels4.append(labels)
-        segments4.extend(segments)
-
-    # Concat/clip labels
-    labels4 = np.concatenate(labels4, 0)
-    for x in (labels4[:, 1:], *segments4):
-        np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
-    # img4, labels4 = replicate(img4, labels4)  # replicate
-
-    # Augment
-    img4, labels4 = random_perspective(img4, labels4, segments4,
-                                       degrees=self.hyp['degrees'],
-                                       translate=self.hyp['translate'],
-                                       scale=self.hyp['scale'],
-                                       shear=self.hyp['shear'],
-                                       perspective=self.hyp['perspective'],
-                                       border=self.mosaic_border)  # border to remove
-
-    return img4, labels4
-
-
-def load_mosaic9(self, index):
-    # loads images in a 9-mosaic
-
-    labels9, segments9 = [], []
-    s = self.img_size
-    indices = [index] + random.choices(self.indices, k=8)  # 8 additional image indices
-    for i, index in enumerate(indices):
-        # Load image
-        img, _, (h, w) = load_image(self, index)
-
-        # place img in img9
-        if i == 0:  # center
-            img9 = np.full((s * 3, s * 3, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
-            h0, w0 = h, w
-            c = s, s, s + w, s + h  # xmin, ymin, xmax, ymax (base) coordinates
-        elif i == 1:  # top
-            c = s, s - h, s + w, s
-        elif i == 2:  # top right
-            c = s + wp, s - h, s + wp + w, s
-        elif i == 3:  # right
-            c = s + w0, s, s + w0 + w, s + h
-        elif i == 4:  # bottom right
-            c = s + w0, s + hp, s + w0 + w, s + hp + h
-        elif i == 5:  # bottom
-            c = s + w0 - w, s + h0, s + w0, s + h0 + h
-        elif i == 6:  # bottom left
-            c = s + w0 - wp - w, s + h0, s + w0 - wp, s + h0 + h
-        elif i == 7:  # left
-            c = s - w, s + h0 - h, s, s + h0
-        elif i == 8:  # top left
-            c = s - w, s + h0 - hp - h, s, s + h0 - hp
-
-        padx, pady = c[:2]
-        x1, y1, x2, y2 = [max(x, 0) for x in c]  # allocate coords
-
-        # Labels
-        labels, segments = self.labels[index].copy(), self.segments[index].copy()
-        if labels.size:
-            labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padx, pady)  # normalized xywh to pixel xyxy format
-            segments = [xyn2xy(x, w, h, padx, pady) for x in segments]
-        labels9.append(labels)
-        segments9.extend(segments)
-
-        # Image
-        img9[y1:y2, x1:x2] = img[y1 - pady:, x1 - padx:]  # img9[ymin:ymax, xmin:xmax]
-        hp, wp = h, w  # height, width previous
-
-    # Offset
-    yc, xc = [int(random.uniform(0, s)) for _ in self.mosaic_border]  # mosaic center x, y
-    img9 = img9[yc:yc + 2 * s, xc:xc + 2 * s]
-
-    # Concat/clip labels
-    labels9 = np.concatenate(labels9, 0)
-    labels9[:, [1, 3]] -= xc
-    labels9[:, [2, 4]] -= yc
-    c = np.array([xc, yc])  # centers
-    segments9 = [x - c for x in segments9]
-
-    for x in (labels9[:, 1:], *segments9):
-        np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
-    # img9, labels9 = replicate(img9, labels9)  # replicate
-
-    # Augment
-    img9, labels9 = random_perspective(img9, labels9, segments9,
-                                       degrees=self.hyp['degrees'],
-                                       translate=self.hyp['translate'],
-                                       scale=self.hyp['scale'],
-                                       shear=self.hyp['shear'],
-                                       perspective=self.hyp['perspective'],
-                                       border=self.mosaic_border)  # border to remove
-
-    return img9, labels9
-
-
-def replicate(img, labels):
-    # Replicate labels
-    h, w = img.shape[:2]
-    boxes = labels[:, 1:].astype(int)
-    x1, y1, x2, y2 = boxes.T
-    s = ((x2 - x1) + (y2 - y1)) / 2  # side length (pixels)
-    for i in s.argsort()[:round(s.size * 0.5)]:  # smallest indices
-        x1b, y1b, x2b, y2b = boxes[i]
-        bh, bw = y2b - y1b, x2b - x1b
-        yc, xc = int(random.uniform(0, h - bh)), int(random.uniform(0, w - bw))  # offset x, y
-        x1a, y1a, x2a, y2a = [xc, yc, xc + bw, yc + bh]
-        img[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
-        labels = np.append(labels, [[labels[i, 0], x1a, y1a, x2a, y2a]], axis=0)
-
-    return img, labels
-
-
-def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True, stride=32):
-    # Resize and pad image while meeting stride-multiple constraints
-    shape = img.shape[:2]  # current shape [height, width]
-    if isinstance(new_shape, int):
-        new_shape = (new_shape, new_shape)
-
-    # Scale ratio (new / old)
-    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-    if not scaleup:  # only scale down, do not scale up (for better test mAP)
-        r = min(r, 1.0)
-
-    # Compute padding
-    ratio = r, r  # width, height ratios
-    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
-    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
-    if auto:  # minimum rectangle
-        dw, dh = np.mod(dw, stride), np.mod(dh, stride)  # wh padding
-    elif scaleFill:  # stretch
-        dw, dh = 0.0, 0.0
-        new_unpad = (new_shape[1], new_shape[0])
-        ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]  # width, height ratios
-
-    dw /= 2  # divide padding into 2 sides
-    dh /= 2
-
-    if shape[::-1] != new_unpad:  # resize
-        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
-    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
-    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
-    img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)  # add border
-    return img, ratio, (dw, dh)
-
-
-def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0,
-                       border=(0, 0)):
-    # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
-    # targets = [cls, xyxy]
-
-    height = img.shape[0] + border[0] * 2  # shape(h,w,c)
-    width = img.shape[1] + border[1] * 2
-
-    # Center
-    C = np.eye(3)
-    C[0, 2] = -img.shape[1] / 2  # x translation (pixels)
-    C[1, 2] = -img.shape[0] / 2  # y translation (pixels)
-
-    # Perspective
-    P = np.eye(3)
-    P[2, 0] = random.uniform(-perspective, perspective)  # x perspective (about y)
-    P[2, 1] = random.uniform(-perspective, perspective)  # y perspective (about x)
-
-    # Rotation and Scale
-    R = np.eye(3)
-    a = random.uniform(-degrees, degrees)
-    # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
-    s = random.uniform(1 - scale, 1 + scale)
-    # s = 2 ** random.uniform(-scale, scale)
-    R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
-
-    # Shear
-    S = np.eye(3)
-    S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
-    S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
-
-    # Translation
-    T = np.eye(3)
-    T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
-    T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
-
-    # Combined rotation matrix
-    M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
-    if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
-        if perspective:
-            img = cv2.warpPerspective(img, M, dsize=(width, height), borderValue=(114, 114, 114))
-        else:  # affine
-            img = cv2.warpAffine(img, M[:2], dsize=(width, height), borderValue=(114, 114, 114))
-
-    # Visualize
-    # import matplotlib.pyplot as plt
-    # ax = plt.subplots(1, 2, figsize=(12, 6))[1].ravel()
-    # ax[0].imshow(img[:, :, ::-1])  # base
-    # ax[1].imshow(img2[:, :, ::-1])  # warped
-
-    # Transform label coordinates
-    n = len(targets)
-    if n:
-        use_segments = any(x.any() for x in segments)
-        new = np.zeros((n, 4))
-        if use_segments:  # warp segments
-            segments = resample_segments(segments)  # upsample
-            for i, segment in enumerate(segments):
-                xy = np.ones((len(segment), 3))
-                xy[:, :2] = segment
-                xy = xy @ M.T  # transform
-                xy = xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]  # perspective rescale or affine
-
-                # clip
-                new[i] = segment2box(xy, width, height)
-
-        else:  # warp boxes
-            xy = np.ones((n * 4, 3))
-            xy[:, :2] = targets[:, [1, 2, 3, 4, 1, 4, 3, 2]].reshape(n * 4, 2)  # x1y1, x2y2, x1y2, x2y1
-            xy = xy @ M.T  # transform
-            xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)  # perspective rescale or affine
-
-            # create new boxes
-            x = xy[:, [0, 2, 4, 6]]
-            y = xy[:, [1, 3, 5, 7]]
-            new = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
-
-            # clip
-            new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
-            new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
-
-        # filter candidates
-        i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
-        targets = targets[i]
-        targets[:, 1:5] = new[i]
-
-    return img, targets
-
-
-def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
-    # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
-    w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
-    w2, h2 = box2[2] - box2[0], box2[3] - box2[1]
-    ar = np.maximum(w2 / (h2 + eps), h2 / (w2 + eps))  # aspect ratio
-    return (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + eps) > area_thr) & (ar < ar_thr)  # candidates
-
-
-def cutout(image, labels):
-    # Applies image cutout augmentation https://arxiv.org/abs/1708.04552
-    h, w = image.shape[:2]
-
-    def bbox_ioa(box1, box2):
-        # Returns the intersection over box2 area given box1, box2. box1 is 4, box2 is nx4. boxes are x1y1x2y2
-        box2 = box2.transpose()
-
-        # Get the coordinates of bounding boxes
+    # Get the coordinates of bounding boxes
+    if x1y1x2y2:  # x1, y1, x2, y2 = box1
         b1_x1, b1_y1, b1_x2, b1_y2 = box1[0], box1[1], box1[2], box1[3]
         b2_x1, b2_y1, b2_x2, b2_y2 = box2[0], box2[1], box2[2], box2[3]
+    else:  # transform from xywh to xyxy
+        b1_x1, b1_x2 = box1[0] - box1[2] / 2, box1[0] + box1[2] / 2
+        b1_y1, b1_y2 = box1[1] - box1[3] / 2, box1[1] + box1[3] / 2
+        b2_x1, b2_x2 = box2[0] - box2[2] / 2, box2[0] + box2[2] / 2
+        b2_y1, b2_y2 = box2[1] - box2[3] / 2, box2[1] + box2[3] / 2
 
-        # Intersection area
-        inter_area = (np.minimum(b1_x2, b2_x2) - np.maximum(b1_x1, b2_x1)).clip(0) * \
-                     (np.minimum(b1_y2, b2_y2) - np.maximum(b1_y1, b2_y1)).clip(0)
+    # Intersection area
+    inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp(0) * \
+            (torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)).clamp(0)
 
-        # box2 area
-        box2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1) + 1e-16
+    # Union Area
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+    union = w1 * h1 + w2 * h2 - inter + eps
 
-        # Intersection over box2 area
-        return inter_area / box2_area
-
-    # create random masks
-    scales = [0.5] * 1 + [0.25] * 2 + [0.125] * 4 + [0.0625] * 8 + [0.03125] * 16  # image size fraction
-    for s in scales:
-        mask_h = random.randint(1, int(h * s))
-        mask_w = random.randint(1, int(w * s))
-
-        # box
-        xmin = max(0, random.randint(0, w) - mask_w // 2)
-        ymin = max(0, random.randint(0, h) - mask_h // 2)
-        xmax = min(w, xmin + mask_w)
-        ymax = min(h, ymin + mask_h)
-
-        # apply random color mask
-        image[ymin:ymax, xmin:xmax] = [random.randint(64, 191) for _ in range(3)]
-
-        # return unobscured labels
-        if len(labels) and s > 0.03:
-            box = np.array([xmin, ymin, xmax, ymax], dtype=np.float32)
-            ioa = bbox_ioa(box, labels[:, 1:5])  # intersection over area
-            labels = labels[ioa < 0.60]  # remove >60% obscured labels
-
-    return labels
-
-
-def create_folder(path='./new'):
-    # Create folder
-    if os.path.exists(path):
-        shutil.rmtree(path)  # delete output folder
-    os.makedirs(path)  # make new output folder
+    iou = inter / union
+    if GIoU or DIoU or CIoU:
+        cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)  # convex (smallest enclosing box) width
+        ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)  # convex height
+        if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
+            c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
+            rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 +
+                    (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center distance squared
+            if DIoU:
+                return iou - rho2 / c2  # DIoU
+            elif CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
+                v = (4 / math.pi ** 2) * torch.pow(torch.atan(w2 / h2) - torch.atan(w1 / h1), 2)
+                with torch.no_grad():
+                    alpha = v / (v - iou + (1 + eps))
+                return iou - (rho2 / c2 + v * alpha)  # CIoU
+        else:  # GIoU https://arxiv.org/pdf/1902.09630.pdf
+            c_area = cw * ch + eps  # convex area
+            return iou - (c_area - union) / c_area  # GIoU
+    else:
+        return iou  # IoU
 
 
-def flatten_recursive(path='../coco128'):
-    # Flatten a recursive directory by bringing all files to top level
-    new_path = Path(path + '_flat')
-    create_folder(new_path)
-    for file in tqdm(glob.glob(str(Path(path)) + '/**/*.*', recursive=True)):
-        shutil.copyfile(file, new_path / Path(file).name)
-
-
-def extract_boxes(path='../coco128/'):  # from utils.datasets import *; extract_boxes('../coco128')
-    # Convert detection dataset into classification dataset, with one directory per class
-
-    path = Path(path)  # images dir
-    shutil.rmtree(path / 'classifier') if (path / 'classifier').is_dir() else None  # remove existing
-    files = list(path.rglob('*.*'))
-    n = len(files)  # number of files
-    for im_file in tqdm(files, total=n):
-        if im_file.suffix[1:] in img_formats:
-            # image
-            im = cv2.imread(str(im_file))[..., ::-1]  # BGR to RGB
-            h, w = im.shape[:2]
-
-            # labels
-            lb_file = Path(img2label_paths([str(im_file)])[0])
-            if Path(lb_file).exists():
-                with open(lb_file, 'r') as f:
-                    lb = np.array([x.split() for x in f.read().strip().splitlines()], dtype=np.float32)  # labels
-
-                for j, x in enumerate(lb):
-                    c = int(x[0])  # class
-                    f = (path / 'classifier') / f'{c}' / f'{path.stem}_{im_file.stem}_{j}.jpg'  # new filename
-                    if not f.parent.is_dir():
-                        f.parent.mkdir(parents=True)
-
-                    b = x[1:] * [w, h, w, h]  # box
-                    # b[2:] = b[2:].max()  # rectangle to square
-                    b[2:] = b[2:] * 1.2 + 3  # pad
-                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
-
-                    b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
-                    b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
-                    assert cv2.imwrite(str(f), im[b[1]:b[3], b[0]:b[2]]), f'box failure in {f}'
-
-def autosplit(path='../coco128', weights=(0.9, 0.1, 0.0), annotated_only=False):
-    """ Autosplit a dataset into train/val/test splits and save path/autosplit_*.txt files
-    Usage: from utils.datasets import *; autosplit('../coco128')
-    Arguments
-        path:           Path to images directory
-        weights:        Train, val, test weights (list)
-        annotated_only: Only use images with an annotated txt file
+def box_iou(box1, box2):
+    # https://github.com/pytorch/vision/blob/master/torchvision/ops/boxes.py
     """
-    path = Path(path)  # images dir
-    files = sum([list(path.rglob(f"*.{img_ext}")) for img_ext in img_formats], [])  # image files only
-    n = len(files)  # number of files
-    indices = random.choices([0, 1, 2], weights=weights, k=n)  # assign each image to a split
+    Return intersection-over-union (Jaccard index) of boxes.
+    Both sets of boxes are expected to be in (x1, y1, x2, y2) format.
+    Arguments:
+        box1 (Tensor[N, 4])
+        box2 (Tensor[M, 4])
+    Returns:
+        iou (Tensor[N, M]): the NxM matrix containing the pairwise
+            IoU values for every element in boxes1 and boxes2
+    """
 
-    txt = ['autosplit_train.txt', 'autosplit_val.txt', 'autosplit_test.txt']  # 3 txt files
-    [(path / x).unlink() for x in txt if (path / x).exists()]  # remove existing
+    def box_area(box):
+        # box = 4xn
+        return (box[2] - box[0]) * (box[3] - box[1])
 
-    print(f'Autosplitting images from {path}' + ', using *.txt labeled images only' * annotated_only)
-    for i, img in tqdm(zip(indices, files), total=n):
-        if not annotated_only or Path(img2label_paths([str(img)])[0]).exists():  # check label
-            with open(path / txt[i], 'a') as f:
-                f.write(str(img) + '\n')  # add image to txt file
+    area1 = box_area(box1.T)
+    area2 = box_area(box2.T)
+
+    # inter(N,M) = (rb(N,M,2) - lt(N,M,2)).clamp(0).prod(2)
+    inter = (torch.min(box1[:, None, 2:], box2[:, 2:]) - torch.max(box1[:, None, :2], box2[:, :2])).clamp(0).prod(2)
+    return inter / (area1[:, None] + area2 - inter)  # iou = inter / (area1 + area2 - inter)
+
+
+def wh_iou(wh1, wh2):
+    # Returns the nxm IoU matrix. wh1 is nx2, wh2 is mx2
+    wh1 = wh1[:, None]  # [N,1,2]
+    wh2 = wh2[None]  # [1,M,2]
+    inter = torch.min(wh1, wh2).prod(2)  # [N,M]
+    return inter / (wh1.prod(2) + wh2.prod(2) - inter)  # iou = inter / (area1 + area2 - inter)
+
+
+def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False,
+                        labels=()):
+    """Runs Non-Maximum Suppression (NMS) on inference results
+
+    Returns:
+         list of detections, on (n,6) tensor per image [xyxy, conf, cls]
+    """
+
+    nc = prediction.shape[2] - 5  # number of classes
+    xc = prediction[..., 4] > conf_thres  # candidates
+
+    # Settings
+    min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
+    max_det = 300  # maximum number of detections per image
+    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
+    time_limit = 10.0  # seconds to quit after
+    redundant = True  # require redundant detections
+    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
+    merge = False  # use merge-NMS
+
+    t = time.time()
+    output = [torch.zeros((0, 6), device=prediction.device)] * prediction.shape[0]
+    out_idx = None
+    for xi, x in enumerate(prediction):  # image index, image inference
+        # Apply constraints
+        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
+        xc_list = xc[0].numpy().tolist()
+        xc_ind = [idx for idx, val in enumerate(xc_list) if val]
+        x = x[xc[xi]]  # confidence
+
+        # Cat apriori labels if autolabelling
+        if labels and len(labels[xi]):
+            l = labels[xi]
+            v = torch.zeros((len(l), nc + 5), device=x.device)
+            v[:, :4] = l[:, 1:5]  # box
+            v[:, 4] = 1.0  # conf
+            v[range(len(l)), l[:, 0].long() + 5] = 1.0  # cls
+            x = torch.cat((x, v), 0)
+
+        # If none remain process next image
+        if not x.shape[0]:
+            continue
+
+        # Compute conf
+        x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+
+        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
+        box = xywh2xyxy(x[:, :4])
+
+        # Detections matrix nx6 (xyxy, conf, cls)
+        if multi_label:
+            i, j = (x[:, 5:] > conf_thres).nonzero(as_tuple=False).T
+            x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
+        else:  # best class only
+            conf, j = x[:, 5:].max(1, keepdim=True)
+            x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
+
+        # Filter by class
+        if classes is not None:
+            x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
+
+        # Apply finite constraint
+        # if not torch.isfinite(x).all():
+        #     x = x[torch.isfinite(x).all(1)]
+
+        # Check shape
+        n = x.shape[0]  # number of boxes
+        if not n:  # no boxes
+            continue
+        elif n > max_nms:  # excess boxes
+            x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence
+
+        # Batched NMS
+        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
+        boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
+        i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
+        if i.shape[0] > max_det:  # limit detections
+            i = i[:max_det]
+        if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
+            # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
+            iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
+            weights = iou * scores[None]  # box weights
+            x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
+            if redundant:
+                i = i[iou.sum(1) > 1]  # require redundancy
+
+        output[xi] = x[i]
+        if (time.time() - t) > time_limit:
+            print(f'WARNING: NMS time limit {time_limit}s exceeded')
+            break  # time limit exceeded
+    if output[0].shape[0] != 0:
+        out_idx = xc_ind[i]
+        return output, out_idx
+    else:
+        return None, None
+
+
+def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_optimizer()
+    # Strip optimizer from 'f' to finalize training, optionally save as 's'
+    x = torch.load(f, map_location=torch.device('cpu'))
+    if x.get('ema'):
+        x['model'] = x['ema']  # replace model with ema
+    for k in 'optimizer', 'training_results', 'wandb_id', 'ema', 'updates':  # keys
+        x[k] = None
+    x['epoch'] = -1
+    x['model'].half()  # to FP16
+    for p in x['model'].parameters():
+        p.requires_grad = False
+    torch.save(x, s or f)
+    mb = os.path.getsize(s or f) / 1E6  # filesize
+    print(f"Optimizer stripped from {f},{(' saved as %s,' % s) if s else ''} {mb:.1f}MB")
+
+
+def print_mutation(hyp, results, yaml_file='hyp_evolved.yaml', bucket=''):
+    # Print mutation results to evolve.txt (for use with train.py --evolve)
+    a = '%10s' * len(hyp) % tuple(hyp.keys())  # hyperparam keys
+    b = '%10.3g' * len(hyp) % tuple(hyp.values())  # hyperparam values
+    c = '%10.4g' * len(results) % results  # results (P, R, mAP@0.5, mAP@0.5:0.95, val_losses x 3)
+    print('\n%s\n%s\nEvolved fitness: %s\n' % (a, b, c))
+
+    if bucket:
+        url = 'gs://%s/evolve.txt' % bucket
+        if gsutil_getsize(url) > (os.path.getsize('evolve.txt') if os.path.exists('evolve.txt') else 0):
+            os.system('gsutil cp %s .' % url)  # download evolve.txt if larger than local
+
+    with open('evolve.txt', 'a') as f:  # append result
+        f.write(c + b + '\n')
+    x = np.unique(np.loadtxt('evolve.txt', ndmin=2), axis=0)  # load unique rows
+    x = x[np.argsort(-fitness(x))]  # sort
+    np.savetxt('evolve.txt', x, '%10.3g')  # save sort by fitness
+
+    # Save yaml
+    for i, k in enumerate(hyp.keys()):
+        hyp[k] = float(x[0, i + 7])
+    with open(yaml_file, 'w') as f:
+        results = tuple(x[0, :7])
+        c = '%10.4g' * len(results) % results  # results (P, R, mAP@0.5, mAP@0.5:0.95, val_losses x 3)
+        f.write('# Hyperparameter Evolution Results\n# Generations: %g\n# Metrics: ' % len(x) + c + '\n\n')
+        yaml.dump(hyp, f, sort_keys=False)
+
+    if bucket:
+        os.system('gsutil cp evolve.txt %s gs://%s' % (yaml_file, bucket))  # upload
+
+
+def apply_classifier(x, model, img, im0):
+    # applies a second stage classifier to yolo outputs
+    im0 = [im0] if isinstance(im0, np.ndarray) else im0
+    for i, d in enumerate(x):  # per image
+        if d is not None and len(d):
+            d = d.clone()
+
+            # Reshape and pad cutouts
+            b = xyxy2xywh(d[:, :4])  # boxes
+            b[:, 2:] = b[:, 2:].max(1)[0].unsqueeze(1)  # rectangle to square
+            b[:, 2:] = b[:, 2:] * 1.3 + 30  # pad
+            d[:, :4] = xywh2xyxy(b).long()
+
+            # Rescale boxes from img_size to im0 size
+            scale_coords(img.shape[2:], d[:, :4], im0[i].shape)
+
+            # Classes
+            pred_cls1 = d[:, 5].long()
+            ims = []
+            for j, a in enumerate(d):  # per item
+                cutout = im0[i][int(a[1]):int(a[3]), int(a[0]):int(a[2])]
+                im = cv2.resize(cutout, (224, 224))  # BGR
+                # cv2.imwrite('test%i.jpg' % j, cutout)
+
+                im = im[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+                im = np.ascontiguousarray(im, dtype=np.float32)  # uint8 to float32
+                im /= 255.0  # 0 - 255 to 0.0 - 1.0
+                ims.append(im)
+
+            pred_cls2 = model(torch.Tensor(ims).to(d.device)).argmax(1)  # classifier prediction
+            x[i] = x[i][pred_cls1 == pred_cls2]  # retain matching class detections
+
+    return x
+
+
+def increment_path(path, exist_ok=True, sep=''):
+    # Increment path, i.e. runs/exp --> runs/exp{sep}0, runs/exp{sep}1 etc.
+    path = Path(path)  # os-agnostic
+    if (path.exists() and exist_ok) or (not path.exists()):
+        return str(path)
+    else:
+        dirs = glob.glob(f"{path}{sep}*")  # similar paths
+        matches = [re.search(rf"%s{sep}(\d+)" % path.stem, d) for d in dirs]
+        i = [int(m.groups()[0]) for m in matches if m]  # indices
+        n = max(i) + 1 if i else 2  # increment number
+        return f"{path}{sep}{n}"  # update path
